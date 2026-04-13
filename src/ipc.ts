@@ -224,10 +224,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
           }
         }
       } catch (err) {
-        logger.error(
-          { err, sourceGroup },
-          'Error reading GWS IPC directory',
-        );
+        logger.error({ err, sourceGroup }, 'Error reading GWS IPC directory');
       }
     }
 

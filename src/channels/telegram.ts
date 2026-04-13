@@ -108,9 +108,7 @@ export class TelegramChannel implements Channel {
       const arg = ctx.message?.text?.split(/\s+/)[1];
 
       // Check self-modify requests first, then GWS
-      const smReq = arg
-        ? getPendingRequest(arg)
-        : getLatestPendingRequest();
+      const smReq = arg ? getPendingRequest(arg) : getLatestPendingRequest();
       const gwsReq = arg
         ? getPendingGwsRequest(arg)
         : getLatestPendingGwsRequest();
@@ -118,11 +116,15 @@ export class TelegramChannel implements Channel {
       // Pick the most recent pending request across both types
       const req =
         smReq && gwsReq
-          ? smReq.timestamp >= gwsReq.timestamp ? smReq : null
+          ? smReq.timestamp >= gwsReq.timestamp
+            ? smReq
+            : null
           : smReq || null;
       const gws =
         smReq && gwsReq
-          ? gwsReq.timestamp > smReq.timestamp ? gwsReq : null
+          ? gwsReq.timestamp > smReq.timestamp
+            ? gwsReq
+            : null
           : gwsReq || null;
 
       if (req) {
@@ -152,20 +154,22 @@ export class TelegramChannel implements Channel {
       }
       const arg = ctx.message?.text?.split(/\s+/)[1];
 
-      const smReq = arg
-        ? getPendingRequest(arg)
-        : getLatestPendingRequest();
+      const smReq = arg ? getPendingRequest(arg) : getLatestPendingRequest();
       const gwsReq = arg
         ? getPendingGwsRequest(arg)
         : getLatestPendingGwsRequest();
 
       const req =
         smReq && gwsReq
-          ? smReq.timestamp >= gwsReq.timestamp ? smReq : null
+          ? smReq.timestamp >= gwsReq.timestamp
+            ? smReq
+            : null
           : smReq || null;
       const gws =
         smReq && gwsReq
-          ? gwsReq.timestamp > smReq.timestamp ? gwsReq : null
+          ? gwsReq.timestamp > smReq.timestamp
+            ? gwsReq
+            : null
           : gwsReq || null;
 
       if (req) {
@@ -187,7 +191,12 @@ export class TelegramChannel implements Channel {
 
     // Telegram bot commands handled above — skip them in the general handler
     // so they don't also get stored as messages. All other /commands flow through.
-    const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping', 'approve', 'deny']);
+    const TELEGRAM_BOT_COMMANDS = new Set([
+      'chatid',
+      'ping',
+      'approve',
+      'deny',
+    ]);
 
     this.bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) {
@@ -321,7 +330,13 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
 
       let content = '[Voice message]';
       try {
@@ -349,7 +364,10 @@ export class TelegramChannel implements Channel {
         is_from_me: false,
       });
 
-      logger.info({ chatJid, sender: senderName }, 'Telegram voice message processed');
+      logger.info(
+        { chatJid, sender: senderName },
+        'Telegram voice message processed',
+      );
     });
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {

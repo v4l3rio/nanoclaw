@@ -7,7 +7,8 @@ import { logger } from './logger.js';
 
 const WHISPER_BIN = process.env.WHISPER_BIN || 'whisper-cli';
 const WHISPER_MODEL =
-  process.env.WHISPER_MODEL || path.join(process.cwd(), 'data/models/ggml-base.bin');
+  process.env.WHISPER_MODEL ||
+  path.join(process.cwd(), 'data/models/ggml-base.bin');
 const WHISPER_LANG = process.env.WHISPER_LANG || 'it';
 
 /**
@@ -25,19 +26,26 @@ export async function transcribeAudio(audio: Buffer): Promise<string | null> {
 
     // Convert to 16kHz mono WAV (whisper.cpp requirement)
     await execPromise('ffmpeg', [
-      '-i', inputPath,
-      '-ar', '16000',
-      '-ac', '1',
-      '-f', 'wav',
+      '-i',
+      inputPath,
+      '-ar',
+      '16000',
+      '-ac',
+      '1',
+      '-f',
+      'wav',
       '-y',
       wavPath,
     ]);
 
     // Run whisper-cli
     const output = await execPromise(WHISPER_BIN, [
-      '-m', WHISPER_MODEL,
-      '-f', wavPath,
-      '-l', WHISPER_LANG,
+      '-m',
+      WHISPER_MODEL,
+      '-f',
+      wavPath,
+      '-l',
+      WHISPER_LANG,
       '--no-timestamps',
       '-nt',
     ]);
@@ -45,10 +53,7 @@ export async function transcribeAudio(audio: Buffer): Promise<string | null> {
     const text = output.trim();
     if (!text) return null;
 
-    logger.info(
-      { chars: text.length },
-      'Transcribed voice message',
-    );
+    logger.info({ chars: text.length }, 'Transcribed voice message');
     return text;
   } catch (err) {
     logger.error({ err }, 'whisper.cpp transcription failed');

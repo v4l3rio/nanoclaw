@@ -22,7 +22,9 @@ const pendingRequests = new Map<string, PendingRequest>();
 
 const CLAUDE_CODE_IPC_DIR = path.join(DATA_DIR, 'ipc');
 
-export function getPendingRequest(requestId: string): PendingRequest | undefined {
+export function getPendingRequest(
+  requestId: string,
+): PendingRequest | undefined {
   return pendingRequests.get(requestId);
 }
 

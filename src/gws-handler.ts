@@ -111,7 +111,10 @@ export async function approveGwsRequest(
   }
   pendingRequests.delete(requestId);
 
-  await sendMessage(req.chatJid, '✅ Approved. Executing Google Workspace operation...');
+  await sendMessage(
+    req.chatJid,
+    '✅ Approved. Executing Google Workspace operation...',
+  );
 
   const responsePath = path.join(
     IPC_BASE,
@@ -124,21 +127,41 @@ export async function approveGwsRequest(
     const result = await executeGwsOperation(req.operation, req.params);
 
     fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-    fs.writeFileSync(responsePath, JSON.stringify({ status: 'approved', result }));
+    fs.writeFileSync(
+      responsePath,
+      JSON.stringify({ status: 'approved', result }),
+    );
 
-    const truncated = result.length > 800 ? result.slice(0, 800) + '...' : result;
+    const truncated =
+      result.length > 800 ? result.slice(0, 800) + '...' : result;
     await sendMessage(req.chatJid, `✅ Done.\n\n${truncated}`);
 
-    audit({ event: 'approved', requestId, operation: req.operation, result: result.slice(0, 500) });
-    logger.info({ requestId, operation: req.operation }, 'GWS operation completed');
+    audit({
+      event: 'approved',
+      requestId,
+      operation: req.operation,
+      result: result.slice(0, 500),
+    });
+    logger.info(
+      { requestId, operation: req.operation },
+      'GWS operation completed',
+    );
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
 
     fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-    fs.writeFileSync(responsePath, JSON.stringify({ status: 'error', error: errorMsg }));
+    fs.writeFileSync(
+      responsePath,
+      JSON.stringify({ status: 'error', error: errorMsg }),
+    );
 
     await sendMessage(req.chatJid, `❌ GWS operation failed: ${errorMsg}`);
-    audit({ event: 'error', requestId, operation: req.operation, error: errorMsg });
+    audit({
+      event: 'error',
+      requestId,
+      operation: req.operation,
+      error: errorMsg,
+    });
     logger.error({ requestId, err }, 'GWS operation failed');
   }
 }
@@ -215,11 +238,14 @@ function formatApprovalMessage(
   }
 }
 
-function sanitizeForAudit(params: Record<string, unknown>): Record<string, unknown> {
+function sanitizeForAudit(
+  params: Record<string, unknown>,
+): Record<string, unknown> {
   // Truncate large fields for audit log
   const result: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
-    result[k] = typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '...' : v;
+    result[k] =
+      typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '...' : v;
   }
   return result;
 }
@@ -285,9 +311,14 @@ async function sendEmail(params: Record<string, unknown>): Promise<string> {
   const raw = Buffer.from(`${headers}\r\n\r\n${body}`).toString('base64url');
 
   const result = await runGws([
-    'gmail', 'users', 'messages', 'send',
-    '--params', JSON.stringify({ userId: 'me' }),
-    '--json', JSON.stringify({ raw }),
+    'gmail',
+    'users',
+    'messages',
+    'send',
+    '--params',
+    JSON.stringify({ userId: 'me' }),
+    '--json',
+    JSON.stringify({ raw }),
   ]);
 
   const parsed = JSON.parse(result);
@@ -296,7 +327,9 @@ async function sendEmail(params: Record<string, unknown>): Promise<string> {
 
 async function createEvent(params: Record<string, unknown>): Promise<string> {
   const explicitAttendees = params.attendees
-    ? String(params.attendees).split(',').map((e) => e.trim())
+    ? String(params.attendees)
+        .split(',')
+        .map((e) => e.trim())
     : [];
   // Always invite the owner
   const allAttendees = [...new Set([...explicitAttendees, OWNER_EMAIL])];
@@ -312,16 +345,22 @@ async function createEvent(params: Record<string, unknown>): Promise<string> {
   };
 
   const result = await runGws([
-    'calendar', 'events', 'insert',
-    '--params', JSON.stringify({ calendarId: 'primary', sendUpdates: 'all' }),
-    '--json', JSON.stringify(body),
+    'calendar',
+    'events',
+    'insert',
+    '--params',
+    JSON.stringify({ calendarId: 'primary', sendUpdates: 'all' }),
+    '--json',
+    JSON.stringify(body),
   ]);
 
   const parsed = JSON.parse(result);
   return `Event created: \`${parsed.htmlLink}\``;
 }
 
-async function createDocument(params: Record<string, unknown>): Promise<string> {
+async function createDocument(
+  params: Record<string, unknown>,
+): Promise<string> {
   const title = String(params.title || 'Untitled');
   const type = String(params.type || 'document');
 
@@ -332,33 +371,57 @@ async function createDocument(params: Record<string, unknown>): Promise<string> 
   };
 
   const result = await runGws([
-    'drive', 'files', 'create',
-    '--json', JSON.stringify({ name: title, mimeType: mimeTypes[type] || mimeTypes.document }),
-    '--params', JSON.stringify({ fields: 'id,webViewLink' }),
+    'drive',
+    'files',
+    'create',
+    '--json',
+    JSON.stringify({
+      name: title,
+      mimeType: mimeTypes[type] || mimeTypes.document,
+    }),
+    '--params',
+    JSON.stringify({ fields: 'id,webViewLink' }),
   ]);
 
   const parsed = JSON.parse(result);
 
   // Always share with owner + any explicit share_with
   const explicitShare = params.share_with
-    ? String(params.share_with).split(',').map((e) => e.trim())
+    ? String(params.share_with)
+        .split(',')
+        .map((e) => e.trim())
     : [];
   const shareList = [...new Set([...explicitShare, OWNER_EMAIL])];
   for (const email of shareList) {
     await runGws([
-      'drive', 'permissions', 'create',
-      '--params', JSON.stringify({ fileId: parsed.id, sendNotificationEmail: 'true' }),
-      '--json', JSON.stringify({ type: 'user', role: 'writer', emailAddress: email }),
+      'drive',
+      'permissions',
+      'create',
+      '--params',
+      JSON.stringify({ fileId: parsed.id, sendNotificationEmail: 'true' }),
+      '--json',
+      JSON.stringify({ type: 'user', role: 'writer', emailAddress: email }),
     ]);
   }
 
   // Insert content if document
   if (params.content && type === 'document') {
     await runGws([
-      'docs', 'documents', 'batchUpdate',
-      '--params', JSON.stringify({ documentId: parsed.id }),
-      '--json', JSON.stringify({
-        requests: [{ insertText: { location: { index: 1 }, text: String(params.content) } }],
+      'docs',
+      'documents',
+      'batchUpdate',
+      '--params',
+      JSON.stringify({ documentId: parsed.id }),
+      '--json',
+      JSON.stringify({
+        requests: [
+          {
+            insertText: {
+              location: { index: 1 },
+              text: String(params.content),
+            },
+          },
+        ],
       }),
     ]);
   }
@@ -368,13 +431,18 @@ async function createDocument(params: Record<string, unknown>): Promise<string> 
 
 async function updateSheet(params: Record<string, unknown>): Promise<string> {
   const result = await runGws([
-    'sheets', 'spreadsheets', 'values', 'update',
-    '--params', JSON.stringify({
+    'sheets',
+    'spreadsheets',
+    'values',
+    'update',
+    '--params',
+    JSON.stringify({
       spreadsheetId: String(params.spreadsheet_id),
       range: String(params.range),
       valueInputOption: 'USER_ENTERED',
     }),
-    '--json', JSON.stringify({ values: params.values }),
+    '--json',
+    JSON.stringify({ values: params.values }),
   ]);
 
   const parsed = JSON.parse(result);

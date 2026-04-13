@@ -75,10 +75,7 @@ export class WebChannel implements Channel {
     res.end();
   }
 
-  private handleSSE(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-  ): void {
+  private handleSSE(req: http.IncomingMessage, res: http.ServerResponse): void {
     const clientId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     res.writeHead(200, {

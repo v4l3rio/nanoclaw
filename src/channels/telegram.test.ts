@@ -33,7 +33,8 @@ const mockLoadSenderAllowlist = vi.fn(() => ({
   logDenied: true,
 }));
 vi.mock('../sender-allowlist.js', () => ({
-  isSenderAllowed: (...args: unknown[]) => mockIsSenderAllowed(...(args as Parameters<typeof mockIsSenderAllowed>)),
+  isSenderAllowed: (...args: unknown[]) =>
+    mockIsSenderAllowed(...(args as Parameters<typeof mockIsSenderAllowed>)),
   loadSenderAllowlist: () => mockLoadSenderAllowlist(),
 }));
 
@@ -44,7 +45,8 @@ const mockApproveRequest = vi.fn().mockResolvedValue(undefined);
 const mockDenyRequest = vi.fn().mockResolvedValue(undefined);
 vi.mock('../self-modify.js', () => ({
   getPendingRequest: (...args: any[]) => mockGetPendingRequest(...args),
-  getLatestPendingRequest: (...args: any[]) => mockGetLatestPendingRequest(...args),
+  getLatestPendingRequest: (...args: any[]) =>
+    mockGetLatestPendingRequest(...args),
   approveRequest: (...args: any[]) => mockApproveRequest(...args),
   denyRequest: (...args: any[]) => mockDenyRequest(...args),
 }));
@@ -56,7 +58,8 @@ const mockApproveGwsRequest = vi.fn().mockResolvedValue(undefined);
 const mockDenyGwsRequest = vi.fn().mockResolvedValue(undefined);
 vi.mock('../gws-handler.js', () => ({
   getPendingGwsRequest: (...args: any[]) => mockGetPendingGwsRequest(...args),
-  getLatestPendingGwsRequest: (...args: any[]) => mockGetLatestPendingGwsRequest(...args),
+  getLatestPendingGwsRequest: (...args: any[]) =>
+    mockGetLatestPendingGwsRequest(...args),
   approveGwsRequest: (...args: any[]) => mockApproveGwsRequest(...args),
   denyGwsRequest: (...args: any[]) => mockDenyGwsRequest(...args),
 }));
