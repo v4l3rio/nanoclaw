@@ -12,6 +12,7 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  DATA_DIR: '/tmp/nanoclaw-test-data',
 }));
 
 // Mock logger
@@ -22,6 +23,42 @@ vi.mock('../logger.js', () => ({
     warn: vi.fn(),
     error: vi.fn(),
   },
+}));
+
+// Mock sender-allowlist
+const mockIsSenderAllowed = vi.fn(() => true);
+const mockLoadSenderAllowlist = vi.fn(() => ({
+  default: { allow: '*', mode: 'trigger' },
+  chats: {},
+  logDenied: true,
+}));
+vi.mock('../sender-allowlist.js', () => ({
+  isSenderAllowed: (...args: unknown[]) => mockIsSenderAllowed(...(args as Parameters<typeof mockIsSenderAllowed>)),
+  loadSenderAllowlist: () => mockLoadSenderAllowlist(),
+}));
+
+// Mock self-modify
+const mockGetPendingRequest = vi.fn();
+const mockGetLatestPendingRequest = vi.fn();
+const mockApproveRequest = vi.fn().mockResolvedValue(undefined);
+const mockDenyRequest = vi.fn().mockResolvedValue(undefined);
+vi.mock('../self-modify.js', () => ({
+  getPendingRequest: (...args: any[]) => mockGetPendingRequest(...args),
+  getLatestPendingRequest: (...args: any[]) => mockGetLatestPendingRequest(...args),
+  approveRequest: (...args: any[]) => mockApproveRequest(...args),
+  denyRequest: (...args: any[]) => mockDenyRequest(...args),
+}));
+
+// Mock gws-handler
+const mockGetPendingGwsRequest = vi.fn();
+const mockGetLatestPendingGwsRequest = vi.fn();
+const mockApproveGwsRequest = vi.fn().mockResolvedValue(undefined);
+const mockDenyGwsRequest = vi.fn().mockResolvedValue(undefined);
+vi.mock('../gws-handler.js', () => ({
+  getPendingGwsRequest: (...args: any[]) => mockGetPendingGwsRequest(...args),
+  getLatestPendingGwsRequest: (...args: any[]) => mockGetLatestPendingGwsRequest(...args),
+  approveGwsRequest: (...args: any[]) => mockApproveGwsRequest(...args),
+  denyGwsRequest: (...args: any[]) => mockDenyGwsRequest(...args),
 }));
 
 // --- Grammy mock ---
@@ -935,6 +972,159 @@ describe('TelegramChannel', () => {
       await handler(ctx);
 
       expect(ctx.reply).toHaveBeenCalledWith('Andy is online.');
+    });
+  });
+
+  // --- Self-modify authorization ---
+
+  describe('/approve and /deny authorization', () => {
+    function createCommandCtx(overrides: {
+      chatId?: number;
+      fromId?: number;
+      text?: string;
+    }) {
+      return {
+        chat: { id: overrides.chatId ?? 100200300 },
+        from: { id: overrides.fromId ?? 99001 },
+        message: { text: overrides.text ?? '/approve' },
+        reply: vi.fn(),
+      };
+    }
+
+    it('/approve rejects unauthorized sender', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(false);
+
+      const handler = currentBot().commandHandlers.get('approve')!;
+      const ctx = createCommandCtx({});
+      await handler(ctx);
+
+      expect(ctx.reply).toHaveBeenCalledWith('Unauthorized.');
+      expect(mockApproveRequest).not.toHaveBeenCalled();
+    });
+
+    it('/deny rejects unauthorized sender', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(false);
+
+      const handler = currentBot().commandHandlers.get('deny')!;
+      const ctx = createCommandCtx({});
+      await handler(ctx);
+
+      expect(ctx.reply).toHaveBeenCalledWith('Unauthorized.');
+      expect(mockDenyRequest).not.toHaveBeenCalled();
+    });
+
+    it('/approve rejects when request is from a different chat', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(true);
+      mockGetLatestPendingRequest.mockReturnValueOnce({
+        requestId: 'req-1',
+        chatJid: 'tg:999999', // different chat
+      });
+
+      const handler = currentBot().commandHandlers.get('approve')!;
+      const ctx = createCommandCtx({ chatId: 100200300 });
+      await handler(ctx);
+
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'Unauthorized: approval must come from the same chat.',
+      );
+      expect(mockApproveRequest).not.toHaveBeenCalled();
+    });
+
+    it('/deny rejects when request is from a different chat', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(true);
+      mockGetLatestPendingRequest.mockReturnValueOnce({
+        requestId: 'req-1',
+        chatJid: 'tg:999999',
+      });
+
+      const handler = currentBot().commandHandlers.get('deny')!;
+      const ctx = createCommandCtx({ chatId: 100200300 });
+      await handler(ctx);
+
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'Unauthorized: approval must come from the same chat.',
+      );
+      expect(mockDenyRequest).not.toHaveBeenCalled();
+    });
+
+    it('/approve succeeds for authorized sender in same chat', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(true);
+      mockGetLatestPendingRequest.mockReturnValueOnce({
+        requestId: 'req-1',
+        chatJid: 'tg:100200300',
+      });
+
+      const handler = currentBot().commandHandlers.get('approve')!;
+      const ctx = createCommandCtx({ chatId: 100200300 });
+      await handler(ctx);
+
+      expect(mockApproveRequest).toHaveBeenCalledWith(
+        'req-1',
+        expect.any(Function),
+      );
+    });
+
+    it('/deny succeeds for authorized sender in same chat', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(true);
+      mockGetLatestPendingRequest.mockReturnValueOnce({
+        requestId: 'req-1',
+        chatJid: 'tg:100200300',
+      });
+
+      const handler = currentBot().commandHandlers.get('deny')!;
+      const ctx = createCommandCtx({ chatId: 100200300 });
+      await handler(ctx);
+
+      expect(mockDenyRequest).toHaveBeenCalledWith(
+        'req-1',
+        expect.any(Function),
+      );
+    });
+
+    it('/approve with request ID looks up specific request', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      mockIsSenderAllowed.mockReturnValueOnce(true);
+      mockGetPendingRequest.mockReturnValueOnce({
+        requestId: 'req-42',
+        chatJid: 'tg:100200300',
+      });
+
+      const handler = currentBot().commandHandlers.get('approve')!;
+      const ctx = createCommandCtx({ text: '/approve req-42' });
+      await handler(ctx);
+
+      expect(mockGetPendingRequest).toHaveBeenCalledWith('req-42');
+      expect(mockApproveRequest).toHaveBeenCalledWith(
+        'req-42',
+        expect.any(Function),
+      );
     });
   });
 

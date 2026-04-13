@@ -8,6 +8,8 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { handleGwsRequest } from './gws-handler.js';
+import { handleClaudeCodeRequest } from './self-modify.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -63,6 +65,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
       const isMain = folderIsMain.get(sourceGroup) === true;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
+      const claudeCodeDir = path.join(ipcBaseDir, sourceGroup, 'claude-code');
 
       // Process messages from this group's IPC directory
       try {
@@ -144,6 +147,87 @@ export function startIpcWatcher(deps: IpcDeps): void {
         }
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
+      }
+
+      // Process claude-code requests (self_modify tool)
+      try {
+        if (fs.existsSync(claudeCodeDir)) {
+          const ccFiles = fs
+            .readdirSync(claudeCodeDir)
+            .filter((f) => f.endsWith('.json') && !f.startsWith('response-'));
+          for (const file of ccFiles) {
+            const filePath = path.join(claudeCodeDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              if (data.type === 'claude_code_request' && isMain) {
+                await handleClaudeCodeRequest(data, deps.sendMessage);
+              } else if (!isMain) {
+                logger.warn(
+                  { sourceGroup },
+                  'Unauthorized claude_code_request from non-main group',
+                );
+              }
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing claude-code request',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              fs.renameSync(
+                filePath,
+                path.join(errorDir, `${sourceGroup}-${file}`),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading claude-code IPC directory',
+        );
+      }
+
+      // Process GWS write requests (gws_* tools)
+      const gwsDir = path.join(ipcBaseDir, sourceGroup, 'gws');
+      try {
+        if (fs.existsSync(gwsDir)) {
+          const gwsFiles = fs
+            .readdirSync(gwsDir)
+            .filter((f) => f.endsWith('.json') && !f.startsWith('response-'));
+          for (const file of gwsFiles) {
+            const filePath = path.join(gwsDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              if (data.type === 'gws_request' && isMain) {
+                await handleGwsRequest(data, deps.sendMessage);
+              } else if (!isMain) {
+                logger.warn(
+                  { sourceGroup },
+                  'Unauthorized gws_request from non-main group',
+                );
+              }
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing GWS request',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              fs.renameSync(
+                filePath,
+                path.join(errorDir, `${sourceGroup}-${file}`),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading GWS IPC directory',
+        );
       }
     }
 

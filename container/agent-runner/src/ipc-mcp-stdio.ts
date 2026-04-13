@@ -337,6 +337,199 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+server.tool(
+  'self_modify',
+  `Request a modification to the NanoClaw codebase itself. This tool sends a prompt to Claude Code running on the host machine. The owner MUST approve the request via Telegram before execution begins. Main group only.
+
+Use this when the user asks you to change your own behavior, add features, fix bugs in yourself, or modify your configuration. The prompt should be a clear, complete instruction for Claude Code — as if the owner were typing it directly.
+
+The tool blocks until approval/denial or timeout (5 minutes). If denied or timed out, no changes are made.`,
+  {
+    prompt: z.string().describe('The full prompt to send to Claude Code. Be specific: describe what files to change and how.'),
+    summary: z.string().describe('A short (1-2 sentence) summary of what this change does, shown to the owner for approval.'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can use self_modify.' }],
+        isError: true,
+      };
+    }
+
+    const requestId = `sm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const CLAUDE_CODE_DIR = path.join(IPC_DIR, 'claude-code');
+    fs.mkdirSync(CLAUDE_CODE_DIR, { recursive: true });
+
+    // Write request
+    writeIpcFile(CLAUDE_CODE_DIR, {
+      type: 'claude_code_request',
+      requestId,
+      prompt: args.prompt,
+      summary: args.summary,
+      chatJid,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Poll for response (timeout: 5 minutes)
+    const responsePath = path.join(CLAUDE_CODE_DIR, `response-${requestId}.json`);
+    const timeout = 5 * 60 * 1000;
+    const pollInterval = 2000;
+    const start = Date.now();
+
+    while (Date.now() - start < timeout) {
+      if (fs.existsSync(responsePath)) {
+        try {
+          const response = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+          fs.unlinkSync(responsePath);
+
+          if (response.status === 'approved') {
+            return {
+              content: [{ type: 'text' as const, text: `Modification completed.\n\n${response.result || '(no output)'}` }],
+            };
+          } else if (response.status === 'denied') {
+            return {
+              content: [{ type: 'text' as const, text: 'Modification denied by the owner.' }],
+            };
+          } else if (response.status === 'error') {
+            return {
+              content: [{ type: 'text' as const, text: `Modification failed: ${response.error}` }],
+              isError: true,
+            };
+          }
+        } catch {
+          // Response file not fully written yet, retry
+        }
+      }
+      await new Promise((r) => setTimeout(r, pollInterval));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Modification request timed out (no approval within 5 minutes).' }],
+      isError: true,
+    };
+  },
+);
+
+// --- Google Workspace write tools (require owner approval via Telegram) ---
+
+const GWS_DIR = path.join(IPC_DIR, 'gws');
+
+/** Write a GWS IPC request and poll for the host response. */
+async function gwsWriteAndPoll(
+  operation: string,
+  params: Record<string, unknown>,
+): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+  if (!isMain) {
+    return {
+      content: [{ type: 'text' as const, text: 'Only the main group can use GWS write tools.' }],
+      isError: true,
+    };
+  }
+
+  const requestId = `gws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  fs.mkdirSync(GWS_DIR, { recursive: true });
+
+  writeIpcFile(GWS_DIR, {
+    type: 'gws_request',
+    requestId,
+    operation,
+    params,
+    chatJid,
+    groupFolder,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Poll for response (timeout: 5 minutes)
+  const responsePath = path.join(GWS_DIR, `response-${requestId}.json`);
+  const timeout = 5 * 60 * 1000;
+  const pollInterval = 2000;
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    if (fs.existsSync(responsePath)) {
+      try {
+        const response = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+        fs.unlinkSync(responsePath);
+        if (response.status === 'approved') {
+          return { content: [{ type: 'text' as const, text: response.result || 'Done.' }] };
+        } else if (response.status === 'denied') {
+          return { content: [{ type: 'text' as const, text: 'Operation denied by the owner.' }] };
+        } else if (response.status === 'error') {
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        }
+      } catch {
+        // not fully written yet
+      }
+    }
+    await new Promise((r) => setTimeout(r, pollInterval));
+  }
+
+  return { content: [{ type: 'text' as const, text: 'Request timed out (no approval within 5 minutes).' }], isError: true };
+}
+
+server.tool(
+  'gws_send_email',
+  'Send an email via Gmail. Requires owner approval via Telegram. Main group only.',
+  {
+    to: z.string().describe('Recipient email address(es), comma-separated'),
+    subject: z.string().describe('Email subject'),
+    body: z.string().describe('Email body (plain text)'),
+    cc: z.string().optional().describe('CC recipients, comma-separated'),
+    bcc: z.string().optional().describe('BCC recipients, comma-separated'),
+  },
+  async (args) => gwsWriteAndPoll('send_email', args),
+);
+
+server.tool(
+  'gws_create_event',
+  'Create a Google Calendar event and send invites. Requires owner approval. Main group only.',
+  {
+    title: z.string().describe('Event title'),
+    start: z.string().describe('Start time in ISO 8601 (e.g., "2026-04-10T09:00:00")'),
+    end: z.string().describe('End time in ISO 8601 (e.g., "2026-04-10T10:00:00")'),
+    attendees: z.string().optional().describe('Attendee emails, comma-separated'),
+    description: z.string().optional().describe('Event description'),
+    location: z.string().optional().describe('Event location'),
+  },
+  async (args) => gwsWriteAndPoll('create_event', args),
+);
+
+server.tool(
+  'gws_create_document',
+  'Create a Google Docs document, Sheets spreadsheet, or Slides presentation. Requires owner approval. Main group only.',
+  {
+    title: z.string().describe('Document title'),
+    type: z.enum(['document', 'sheet', 'slide']).describe('Type: document, sheet, or slide'),
+    content: z.string().optional().describe('Initial content (for documents only)'),
+    share_with: z.string().optional().describe('Emails to share with (writer access), comma-separated'),
+  },
+  async (args) => gwsWriteAndPoll('create_document', args),
+);
+
+server.tool(
+  'gws_update_sheet',
+  'Update cells in a Google Sheets spreadsheet. Requires owner approval. Main group only.',
+  {
+    spreadsheet_id: z.string().describe('The spreadsheet ID (from the URL)'),
+    range: z.string().describe('A1 notation range (e.g., "Sheet1!A1:C3")'),
+    values: z.string().describe('JSON array of arrays (e.g., [["a","b"],["c","d"]])'),
+  },
+  async (args) => {
+    let parsedValues: string[][];
+    try {
+      parsedValues = JSON.parse(args.values);
+    } catch {
+      return { content: [{ type: 'text' as const, text: 'Invalid JSON for values. Must be array of arrays.' }], isError: true };
+    }
+    return gwsWriteAndPoll('update_sheet', {
+      spreadsheet_id: args.spreadsheet_id,
+      range: args.range,
+      values: parsedValues,
+    });
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

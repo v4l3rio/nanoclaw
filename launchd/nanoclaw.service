@@ -1,0 +1,22 @@
+[Unit]
+Description=NanoClaw agent service
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{PROJECT_ROOT}}
+ExecStart={{NODE_PATH}} {{PROJECT_ROOT}}/dist/index.js
+Restart=always
+RestartSec=5
+
+Environment=NODE_ENV=production
+Environment=HOME=/home/{{USER}}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+StandardOutput=append:{{PROJECT_ROOT}}/logs/nanoclaw.log
+StandardError=append:{{PROJECT_ROOT}}/logs/nanoclaw.error.log
+
+[Install]
+WantedBy=multi-user.target
