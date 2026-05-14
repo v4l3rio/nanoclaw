@@ -32,10 +32,7 @@ const SONNET_FLOOR_PATTERNS =
  * @param opts.isScheduledTask - true for cron/heartbeat tasks → always Haiku
  * @param opts.prompt - the user message or task prompt
  */
-export function selectModel(opts: {
-  isScheduledTask?: boolean;
-  prompt: string;
-}): string {
+export function selectModel(opts: { isScheduledTask?: boolean; prompt: string }): string {
   // ── Fixed rule ──────────────────────────────────────────────────────────────
   // Scheduled tasks and heartbeats always use Haiku regardless of content.
   if (opts.isScheduledTask) return MODELS.haiku;

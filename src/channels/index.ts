@@ -8,8 +8,8 @@
 
 import './cli.js';
 
-// telegram
-import './telegram.js';
+// telegram — needs porting to new adapter architecture, temporarily disabled
+// import './telegram.js';
 
-// web
-import './web.js';
+// web — needs porting to new adapter architecture, temporarily disabled
+// import './web.js';

@@ -8,15 +8,11 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
-import { logger } from './logger.js';
+import { log } from './log.js';
 
 // --- Types ---
 
-type GwsOperation =
-  | 'send_email'
-  | 'create_event'
-  | 'create_document'
-  | 'update_sheet';
+type GwsOperation = 'send_email' | 'create_event' | 'create_document' | 'update_sheet';
 
 interface PendingGwsRequest {
   requestId: string;
@@ -42,10 +38,7 @@ const OWNER_EMAIL = process.env.GWS_OWNER_EMAIL || 'diziovale@gmail.com';
 function audit(entry: Record<string, unknown>): void {
   try {
     fs.mkdirSync(path.dirname(AUDIT_LOG), { recursive: true });
-    fs.appendFileSync(
-      AUDIT_LOG,
-      JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n',
-    );
+    fs.appendFileSync(AUDIT_LOG, JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n');
   } catch {
     // best-effort
   }
@@ -53,9 +46,7 @@ function audit(entry: Record<string, unknown>): void {
 
 // --- Public API ---
 
-export function getPendingGwsRequest(
-  requestId: string,
-): PendingGwsRequest | undefined {
+export function getPendingGwsRequest(requestId: string): PendingGwsRequest | undefined {
   return pendingRequests.get(requestId);
 }
 
@@ -81,10 +72,7 @@ export async function handleGwsRequest(
   pendingRequests.set(data.requestId, data);
 
   const summary = formatApprovalMessage(data.operation, data.params);
-  await sendMessage(
-    data.chatJid,
-    `📋 *Google Workspace request*\n\n${summary}\n\nReply /approve or /deny`,
-  );
+  await sendMessage(data.chatJid, `📋 *Google Workspace request*\n\n${summary}\n\nReply /approve or /deny`);
 
   audit({
     event: 'request',
@@ -94,10 +82,7 @@ export async function handleGwsRequest(
     groupFolder: data.groupFolder,
   });
 
-  logger.info(
-    { requestId: data.requestId, operation: data.operation },
-    'GWS approval requested',
-  );
+  log.info('GWS approval requested', { requestId: data.requestId, operation: data.operation });
 }
 
 export async function approveGwsRequest(
@@ -106,34 +91,22 @@ export async function approveGwsRequest(
 ): Promise<void> {
   const req = pendingRequests.get(requestId);
   if (!req) {
-    logger.warn({ requestId }, 'GWS approve called for unknown request');
+    log.warn('GWS approve called for unknown request', { requestId });
     return;
   }
   pendingRequests.delete(requestId);
 
-  await sendMessage(
-    req.chatJid,
-    '✅ Approved. Executing Google Workspace operation...',
-  );
+  await sendMessage(req.chatJid, '✅ Approved. Executing Google Workspace operation...');
 
-  const responsePath = path.join(
-    IPC_BASE,
-    req.groupFolder,
-    'gws',
-    `response-${requestId}.json`,
-  );
+  const responsePath = path.join(IPC_BASE, req.groupFolder, 'gws', `response-${requestId}.json`);
 
   try {
     const result = await executeGwsOperation(req.operation, req.params);
 
     fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-    fs.writeFileSync(
-      responsePath,
-      JSON.stringify({ status: 'approved', result }),
-    );
+    fs.writeFileSync(responsePath, JSON.stringify({ status: 'approved', result }));
 
-    const truncated =
-      result.length > 800 ? result.slice(0, 800) + '...' : result;
+    const truncated = result.length > 800 ? result.slice(0, 800) + '...' : result;
     await sendMessage(req.chatJid, `✅ Done.\n\n${truncated}`);
 
     audit({
@@ -142,18 +115,12 @@ export async function approveGwsRequest(
       operation: req.operation,
       result: result.slice(0, 500),
     });
-    logger.info(
-      { requestId, operation: req.operation },
-      'GWS operation completed',
-    );
+    log.info('GWS operation completed', { requestId, operation: req.operation });
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
 
     fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-    fs.writeFileSync(
-      responsePath,
-      JSON.stringify({ status: 'error', error: errorMsg }),
-    );
+    fs.writeFileSync(responsePath, JSON.stringify({ status: 'error', error: errorMsg }));
 
     await sendMessage(req.chatJid, `❌ GWS operation failed: ${errorMsg}`);
     audit({
@@ -162,7 +129,7 @@ export async function approveGwsRequest(
       operation: req.operation,
       error: errorMsg,
     });
-    logger.error({ requestId, err }, 'GWS operation failed');
+    log.error('GWS operation failed', { requestId, err });
   }
 }
 
@@ -172,32 +139,24 @@ export async function denyGwsRequest(
 ): Promise<void> {
   const req = pendingRequests.get(requestId);
   if (!req) {
-    logger.warn({ requestId }, 'GWS deny called for unknown request');
+    log.warn('GWS deny called for unknown request', { requestId });
     return;
   }
   pendingRequests.delete(requestId);
 
-  const responsePath = path.join(
-    IPC_BASE,
-    req.groupFolder,
-    'gws',
-    `response-${requestId}.json`,
-  );
+  const responsePath = path.join(IPC_BASE, req.groupFolder, 'gws', `response-${requestId}.json`);
 
   fs.mkdirSync(path.dirname(responsePath), { recursive: true });
   fs.writeFileSync(responsePath, JSON.stringify({ status: 'denied' }));
 
   await sendMessage(req.chatJid, '🚫 GWS operation denied.');
   audit({ event: 'denied', requestId, operation: req.operation });
-  logger.info({ requestId }, 'GWS operation denied');
+  log.info('GWS operation denied', { requestId });
 }
 
 // --- Approval message formatting ---
 
-function formatApprovalMessage(
-  operation: GwsOperation,
-  params: Record<string, unknown>,
-): string {
+function formatApprovalMessage(operation: GwsOperation, params: Record<string, unknown>): string {
   switch (operation) {
     case 'send_email': {
       const body = String(params.body || '');
@@ -216,9 +175,7 @@ function formatApprovalMessage(
         `When: ${params.start} — ${params.end}\n` +
         (params.attendees ? `Attendees: ${params.attendees}\n` : '') +
         (params.location ? `Location: ${params.location}\n` : '') +
-        (params.description
-          ? `Description: ${String(params.description).slice(0, 150)}`
-          : '')
+        (params.description ? `Description: ${String(params.description).slice(0, 150)}` : '')
       );
     case 'create_document':
       return (
@@ -238,14 +195,11 @@ function formatApprovalMessage(
   }
 }
 
-function sanitizeForAudit(
-  params: Record<string, unknown>,
-): Record<string, unknown> {
+function sanitizeForAudit(params: Record<string, unknown>): Record<string, unknown> {
   // Truncate large fields for audit log
   const result: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
-    result[k] =
-      typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '...' : v;
+    result[k] = typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '...' : v;
   }
   return result;
 }
@@ -270,10 +224,7 @@ function runGws(args: string[]): Promise<string> {
   });
 }
 
-async function executeGwsOperation(
-  operation: GwsOperation,
-  params: Record<string, unknown>,
-): Promise<string> {
+async function executeGwsOperation(operation: GwsOperation, params: Record<string, unknown>): Promise<string> {
   switch (operation) {
     case 'send_email':
       return sendEmail(params);
@@ -358,9 +309,7 @@ async function createEvent(params: Record<string, unknown>): Promise<string> {
   return `Event created: \`${parsed.htmlLink}\``;
 }
 
-async function createDocument(
-  params: Record<string, unknown>,
-): Promise<string> {
+async function createDocument(params: Record<string, unknown>): Promise<string> {
   const title = String(params.title || 'Untitled');
   const type = String(params.type || 'document');
 

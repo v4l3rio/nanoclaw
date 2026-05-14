@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
-import { logger } from './logger.js';
+import { log } from './log.js';
 
 interface PendingRequest {
   requestId: string;
@@ -22,9 +22,7 @@ const pendingRequests = new Map<string, PendingRequest>();
 
 const CLAUDE_CODE_IPC_DIR = path.join(DATA_DIR, 'ipc');
 
-export function getPendingRequest(
-  requestId: string,
-): PendingRequest | undefined {
+export function getPendingRequest(requestId: string): PendingRequest | undefined {
   return pendingRequests.get(requestId);
 }
 
@@ -64,10 +62,7 @@ export async function handleClaudeCodeRequest(
 
   await sendMessage(chatJid, approvalMsg);
 
-  logger.info(
-    { requestId, groupFolder, summary },
-    'Self-modify approval requested',
-  );
+  log.info('Self-modify approval requested', { requestId, groupFolder, summary });
 }
 
 /**
@@ -79,7 +74,7 @@ export async function approveRequest(
 ): Promise<void> {
   const req = pendingRequests.get(requestId);
   if (!req) {
-    logger.warn({ requestId }, 'Approve called for unknown request');
+    log.warn('Approve called for unknown request', { requestId });
     return;
   }
   pendingRequests.delete(requestId);
@@ -87,41 +82,26 @@ export async function approveRequest(
   await sendMessage(req.chatJid, '✅ Approved. Running Claude Code...');
 
   const projectRoot = process.cwd();
-  const responsePath = path.join(
-    CLAUDE_CODE_IPC_DIR,
-    req.groupFolder,
-    'claude-code',
-    `response-${requestId}.json`,
-  );
+  const responsePath = path.join(CLAUDE_CODE_IPC_DIR, req.groupFolder, 'claude-code', `response-${requestId}.json`);
 
   try {
     const result = await runClaudeCode(req.prompt, projectRoot);
 
     fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-    fs.writeFileSync(
-      responsePath,
-      JSON.stringify({ status: 'approved', result }),
-    );
+    fs.writeFileSync(responsePath, JSON.stringify({ status: 'approved', result }));
 
-    const truncated =
-      result.length > 1000 ? result.slice(0, 1000) + '...' : result;
-    await sendMessage(
-      req.chatJid,
-      `✅ Modification complete.\n\n\`\`\`\n${truncated}\n\`\`\``,
-    );
+    const truncated = result.length > 1000 ? result.slice(0, 1000) + '...' : result;
+    await sendMessage(req.chatJid, `✅ Modification complete.\n\n\`\`\`\n${truncated}\n\`\`\``);
 
-    logger.info({ requestId }, 'Self-modify completed');
+    log.info('Self-modify completed', { requestId });
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
 
     fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-    fs.writeFileSync(
-      responsePath,
-      JSON.stringify({ status: 'error', error: errorMsg }),
-    );
+    fs.writeFileSync(responsePath, JSON.stringify({ status: 'error', error: errorMsg }));
 
     await sendMessage(req.chatJid, `❌ Modification failed: ${errorMsg}`);
-    logger.error({ requestId, err }, 'Self-modify failed');
+    log.error('Self-modify failed', { requestId, err });
   }
 }
 
@@ -134,23 +114,18 @@ export async function denyRequest(
 ): Promise<void> {
   const req = pendingRequests.get(requestId);
   if (!req) {
-    logger.warn({ requestId }, 'Deny called for unknown request');
+    log.warn('Deny called for unknown request', { requestId });
     return;
   }
   pendingRequests.delete(requestId);
 
-  const responsePath = path.join(
-    CLAUDE_CODE_IPC_DIR,
-    req.groupFolder,
-    'claude-code',
-    `response-${requestId}.json`,
-  );
+  const responsePath = path.join(CLAUDE_CODE_IPC_DIR, req.groupFolder, 'claude-code', `response-${requestId}.json`);
 
   fs.mkdirSync(path.dirname(responsePath), { recursive: true });
   fs.writeFileSync(responsePath, JSON.stringify({ status: 'denied' }));
 
   await sendMessage(req.chatJid, '🚫 Modification denied.');
-  logger.info({ requestId }, 'Self-modify denied');
+  log.info('Self-modify denied', { requestId });
 }
 
 function runClaudeCode(prompt: string, cwd: string): Promise<string> {
