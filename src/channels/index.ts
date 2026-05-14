@@ -12,3 +12,6 @@ import './telegram.js';
 
 // web — needs porting to new adapter architecture, temporarily disabled
 // import './web.js';
+
+// emacs
+import './emacs.js';
