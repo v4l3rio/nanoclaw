@@ -199,15 +199,30 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      const isQuotaError = /rate.limit|quota|429|too.many.requests|insufficient_quota/i.test(errMsg);
+      if (isQuotaError) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({
+            text:
+              '⚠️ Limite raggiunto. Si resetta automaticamente entro pochi minuti. Riprova più tardi.',
+          }),
+        });
+      } else {
+        // Write generic error response so the user knows something went wrong
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      }
     } finally {
       clearCurrentInReplyTo();
     }
@@ -369,6 +384,18 @@ async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'error' && event.classification === 'quota') {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({
+            text:
+              '⚠️ Limite raggiunto. Si resetta automaticamente entro pochi minuti. Riprova più tardi.',
+          }),
+        });
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
