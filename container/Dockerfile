@@ -15,6 +15,8 @@ FROM node:22-slim
 # ---- Build-time arguments ----------------------------------------------------
 # CJK fonts add ~200MB. Opt in only if you render Chinese/Japanese/Korean text.
 ARG INSTALL_CJK_FONTS=false
+# Blender MCP adds Python + pip. Opt in only if you use the Blender MCP server.
+ARG INSTALL_BLENDER_MCP=false
 
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
@@ -53,7 +55,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         python3-pip \
         tini \
         unzip \
-    && pip3 install blender-mcp --break-system-packages \
+    && if [ "$INSTALL_BLENDER_MCP" = "true" ]; then \
+        pip3 install "blender-mcp==0.2.0" --user; \
+       fi \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \

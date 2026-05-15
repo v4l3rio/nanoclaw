@@ -7,11 +7,4 @@
 // self-registration import below.
 
 import './cli.js';
-
 import './telegram.js';
-
-// web — needs porting to new adapter architecture, temporarily disabled
-// import './web.js';
-
-// emacs — needs porting to new adapter architecture, temporarily disabled
-// import './emacs.js';
