@@ -138,6 +138,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // Download attachment data before serialization loses fetchData()
     if (message.attachments && message.attachments.length > 0) {
       const enriched = [];
+      const transcripts: string[] = [];
       for (const att of message.attachments) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const entry: Record<string, any> = {
@@ -152,13 +153,27 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           try {
             const buffer = await att.fetchData();
             entry.data = buffer.toString('base64');
+            const isVoice =
+              att.type === 'audio' || (typeof att.mimeType === 'string' && att.mimeType.startsWith('audio/'));
+            if (isVoice) {
+              const { transcribeAudio } = await import('../transcription.js');
+              const transcript = await transcribeAudio(buffer);
+              if (transcript) {
+                transcripts.push(transcript);
+                entry.transcript = transcript;
+              }
+            }
           } catch (err) {
-            log.warn('Failed to download attachment', { type: att.type, err });
+            log.warn('Failed to download/transcribe attachment', { type: att.type, err });
           }
         }
         enriched.push(entry);
       }
       serialized.attachments = enriched;
+      if (transcripts.length > 0) {
+        const joined = transcripts.join(' ');
+        serialized.text = serialized.text ? `${serialized.text}\n[Voice: ${joined}]` : `[Voice: ${joined}]`;
+      }
     }
 
     // Extract reply context via platform-specific hook
