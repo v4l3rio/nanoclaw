@@ -468,7 +468,7 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
-    const body = match[2].trim();
+    const body = stripInternalTags(match[2]);
     lastIndex = MESSAGE_RE.lastIndex;
 
     const dest = findByName(toName);
