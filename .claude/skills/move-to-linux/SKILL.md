@@ -1,135 +1,107 @@
 ---
 name: move-to-linux
-description: Restore a NanoClaw install from a Mac bundle onto this Linux machine, end-to-end (deps, paths, container, systemd service).
+description: Restore a NanoClaw install on this Linux machine from a Mac-produced encrypted bundle. Two channels — code via git clone, secrets+state via the bundle. Configures always-on systemd.
 ---
 
 # /move-to-linux
 
-End-to-end restore of a NanoClaw install previously bundled with `scripts/migrate/bundle.sh` on a Mac. Runs on the **destination Linux machine**.
+End-to-end restore on the **destination Linux machine**. Two transfer channels:
 
-## When to use
+- **Code** → `git clone https://github.com/v4l3rio/nanoclaw.git` (public, no secrets)
+- **Secrets + state** → encrypted bundle file produced on the Mac by `scripts/migrate/bundle.sh` (`.env`, `data/`, `groups/`, full OneCLI vault dump + master key + NEXTAUTH_SECRET)
 
-The user has produced a `.tar.gz.enc` bundle on their Mac (via `bash scripts/migrate/bundle.sh`) and wants to reproduce the same state here, including DB, groups, OneCLI vault, channel configs, and the systemd service.
+## Step 1 — preflight
 
-## Prerequisites — verify FIRST
-
-Before doing anything, check the Linux machine has:
+Verify required tools:
 
 ```bash
 for c in openssl rsync git docker node pnpm bun; do
   printf '%-8s %s\n' "$c" "$(command -v $c || echo MISSING)"
 done
-node --version
+node --version    # need >= 20
 docker --version
 ```
 
-If anything is `MISSING`, tell the user *what* is missing and the right install recipe for their distro. Do **not** install anything system-wide without explicit user confirmation (`sudo` calls require asking first).
+If anything is `MISSING`, tell the user which command to install — do not install system-wide things without explicit consent.
 
-Recipes to suggest (Debian/Ubuntu):
+Quick recipes (Debian/Ubuntu):
 - `sudo apt update && sudo apt install -y openssl rsync git ca-certificates curl`
-- Docker: `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER` (user must log out/in after)
-- Node 22: `curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs`
-- pnpm: `npm install -g pnpm`
-- Bun: `curl -fsSL https://bun.sh/install | bash`
+- `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER` (re-login after)
+- `curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs`
+- `npm install -g pnpm`
+- `curl -fsSL https://bun.sh/install | bash`
 
-## Step 1 — locate the bundle and the destination
-
-Ask the user:
-1. Full path to the encrypted bundle (e.g. `~/Downloads/nanoclaw-bundle.enc`).
-2. Where to install nanoclaw on this machine (default: `~/nanoclaw`).
-
-Confirm both before proceeding. If the destination already exists and is non-empty, ask whether to overwrite or pick another path — **never silently overwrite**.
-
-## Step 2 — run the restore script
-
-The restore script handles decryption, deps, paths, container build, and systemd unit creation. The user types the passphrase interactively (Claude never sees it).
+## Step 2 — clone the repo
 
 ```bash
-cd <DEST>   # not needed if DEST doesn't exist yet — script will mkdir
-bash <bundle-dir>/scripts/migrate/restore.sh <BUNDLE_PATH> <DEST>
+git clone https://github.com/v4l3rio/nanoclaw.git ~/nanoclaw
 ```
 
-**Important**: the `restore.sh` script lives inside the bundle. You first need to extract it from the bundle, or get a copy via `git clone` of the public nanoclaw repo:
+Default dest is `~/nanoclaw` but the user can choose anywhere.
+
+## Step 3 — transfer the bundle
+
+The bundle is the `.enc` file the user produced on the Mac. Options:
+
+- **USB**: plug in, `cp /media/<user>/<usb>/nanoclaw-bundle.enc ~/` — cleanest, air-gapped.
+- **scp**: `scp user@mac:~/nanoclaw-bundle.enc ~/` — needs SSH on either side.
+- **AirDrop, Drive, Dropbox**: the file is already AES-256 encrypted, so it's safe in transit, but USB is still preferred for one-shot.
+
+## Step 4 — run the restore
 
 ```bash
-# Option A: clone trunk separately to get restore.sh
-git clone https://github.com/nanocoai/nanoclaw /tmp/nanoclaw-tools
-bash /tmp/nanoclaw-tools/scripts/migrate/restore.sh ~/nanoclaw-bundle.enc ~/nanoclaw
+cd ~/nanoclaw
+bash scripts/migrate/restore.sh ~/nanoclaw-bundle.enc ~/nanoclaw
 ```
 
-The script will prompt for the bundle passphrase. The user types it (it's the same one used during `bundle.sh` on the Mac).
+The script will:
+1. Prompt for the bundle passphrase (same one used on the Mac).
+2. Restore `.env`, `data/`, `groups/` into the cloned repo.
+3. Rewrite any absolute path that referenced the Mac install root.
+4. **Restore the OneCLI vault**:
+   - create Docker volumes `onecli_pgdata` + `onecli_app-data`
+   - extract the master key into `app-data`
+   - `docker compose up postgres`
+   - `psql … < pgdump.sql` → restore secrets table
+   - write `NEXTAUTH_SECRET` + `POSTGRES_*` to `~/.env`
+   - `docker compose up -d` (full OneCLI stack)
+5. `pnpm install` + `bun install` + build host + build agent container image.
+6. Patch `container_configs.config_json` host paths in `data/v2.db`.
+7. Install the systemd user unit with `Restart=always`.
+8. Apply always-on hardening (sudo prompt once): docker enabled at boot, `loginctl enable-linger`, lid suspend disabled, sleep targets masked, daily logrotate cron, unattended-upgrades.
 
-## Step 3 — restore OneCLI binary (if not already present)
+Expect ~10 minutes total, dominated by `./container/build.sh` (Docker image bake).
 
-The bundle includes `~/.onecli/` (config + vault) but **not** the `onecli` binary itself, since it's platform-specific. After the restore script finishes:
+## Step 5 — verify
 
 ```bash
-command -v onecli || echo "OneCLI binary missing — install it"
+onecli secrets list                    # should print the same count as on the Mac
+~/nanoclaw/bin/ncl groups list
+~/nanoclaw/bin/ncl messaging-groups list
+systemctl --user start nanoclaw
+tail -f ~/nanoclaw/logs/nanoclaw.log
 ```
 
-If missing, point the user to the `/init-onecli` skill or to download the Linux release from OneCLI's distribution channel. The vault config at `~/.onecli/` was already copied — once the binary is installed it'll pick it up.
+Send a test message on the wired channel. First message after a fresh install respawns each agent's container — expect 10-20s delay. Subsequent messages should dispatch immediately.
 
-Confirm secrets came through:
-```bash
-onecli agents list
-onecli secrets list
-```
+## Common gotchas
 
-If they're empty even though `~/.onecli/config.json` was restored, the credentials file on macOS was likely encrypted with the Keychain. Tell the user: re-add the API keys via OneCLI web UI at `http://127.0.0.1:10254`. The list of *which* secrets to re-add can be derived from the per-agent CLAUDE.md files and `groups/*/container.json` mcpServers entries.
+- **`docker` denied** → user not in `docker` group. `sudo usermod -aG docker $USER` then log out/in.
+- **`onecli secrets list` empty** → check `docker logs onecli-app-1` and `docker logs onecli-postgres-1`. Most common cause: `NEXTAUTH_SECRET` mismatch between bundle and `~/.env`. Re-run restore (idempotent).
+- **`NODE_MODULE_VERSION` mismatch** for better-sqlite3 → `(cd ~/nanoclaw && pnpm rebuild better-sqlite3)`.
+- **Channels with webhooks** (not Telegram/polling) → public URL likely changed. Re-register webhook on the platform side; tokens themselves are restored automatically by the OneCLI vault.
 
-## Step 4 — start the service
+## Only thing left to the human
 
-```bash
-systemctl --user enable --now nanoclaw
-systemctl --user status nanoclaw
-tail -f ~/nanoclaw/logs/nanoclaw.log    # adjust path
-```
+- BIOS/UEFI: set `AC Power Recovery = Power On` so the machine reboots itself after a power outage. The OS can't do this for you.
 
-If the service crashes immediately, the first place to look is `logs/nanoclaw.error.log` for delivery / DB connection errors. Common Linux-specific gotchas:
+## Rollback
 
-- **Docker socket permission**: user must be in `docker` group (`groups | grep docker`) — if not, `sudo usermod -aG docker $USER` then log out/in.
-- **better-sqlite3 native binding**: if you see `NODE_MODULE_VERSION` mismatch, run `(cd ~/nanoclaw && pnpm rebuild better-sqlite3)`.
-- **lingering host paths**: if anything refers to `/Users/<old>`, run a final pass:
-  ```bash
-  grep -rn '/Users/' ~/nanoclaw --include='*.json' --include='*.sh' \
-    --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=logs
-  ```
+The restore is non-destructive on the Mac side — re-bundle and re-restore freely. If the Linux restore goes wrong:
 
-## Step 5 — always-on hardening (automatic)
-
-`restore.sh` applies all of the following automatically (the user types the sudo password once):
-
-- `docker.service` enabled at boot
-- `loginctl enable-linger` (user services survive logout)
-- `/etc/systemd/logind.conf` lid-switch settings → `ignore` (laptops don't suspend on lid close)
-- `sleep.target / suspend.target / hibernate.target / hybrid-sleep.target` masked
-- Daily logrotate via user crontab
-- `unattended-upgrades` (Debian/Ubuntu) for security patches
-- systemd unit uses `Restart=always` with a crash-loop guard (10 restarts in 5 min)
-
-**Only thing left to the user**, since it's outside the OS:
-- BIOS/UEFI: set `AC Power Recovery = Power On` so the machine reboots itself after a power outage.
-
-## Step 6 — smoke test
-
-Have the user send a test message on whatever channel was wired. Watch:
-```bash
-tail -f ~/nanoclaw/logs/nanoclaw.log ~/nanoclaw/logs/nanoclaw.error.log
-```
-
-For each agent group, the first message after a fresh install will respawn its container — expect a 10-20s delay. Subsequent messages should be sub-second to dispatch.
-
-## What this skill does NOT do
-
-- Doesn't install Docker, Node, pnpm, or Bun (asks the user to do it).
-- Doesn't migrate API keys / OAuth tokens that were stored in macOS Keychain only — those have to be re-pasted into OneCLI web UI.
-- Doesn't migrate platform-specific bot registrations (Telegram, Slack, etc. tokens come along *if* they were in `.env` or in OneCLI vault; webhook URLs may need re-registering if they hit a different public hostname).
-
-## Recovery / rollback
-
-The bundle is non-destructive on the source machine — re-bundling and re-restoring is always safe. If the restore goes sideways, delete the destination dir and start over:
 ```bash
 systemctl --user stop nanoclaw 2>/dev/null
+docker compose -f ~/.onecli/docker-compose.yml down -v   # also removes volumes
 rm -rf ~/nanoclaw
+# then git clone again and re-run restore.sh
 ```
-Then re-run the restore command.

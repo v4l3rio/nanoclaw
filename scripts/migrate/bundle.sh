@@ -1,86 +1,104 @@
 #!/usr/bin/env bash
-# bundle.sh — create an encrypted, cross-platform snapshot of this NanoClaw install
-# for restoring on a different machine (typically Mac → Linux).
+# bundle.sh — create an encrypted, cross-arch snapshot of THE SECRETS + STATE
+# of this NanoClaw install. The code itself is NOT bundled (it lives in git).
 #
-# Usage:
-#   bash scripts/migrate/bundle.sh <output-path.tar.gz.enc>
+# What goes in:
+#   .env, data/, groups/                              ← repo-local state
+#   onecli/pgdump.sql                                 ← Postgres dump (secrets, agents, rules)
+#   onecli/app-data.tar.gz                            ← master encryption key
+#   onecli/env.txt                                    ← NEXTAUTH_SECRET + POSTGRES_* runtime env
+#   onecli/{config.json,docker-compose.yml}           ← OneCLI client config
+#   MANIFEST.json                                     ← source root, timestamp, versions
 #
-# What's included:
-#   - The full git tree (clean copy, no node_modules / .git / logs)
-#   - data/v2.db + data/v2-sessions/ (host + per-session SQLite)
-#   - groups/                        (per-agent-group fs: CLAUDE.local.md, skills, etc.)
-#   - .env
-#   - OneCLI config (~/.onecli/), if present
+# Output: a single AES-256-CBC encrypted file. The passphrase is typed
+# interactively; it never touches disk and never goes through Claude.
 #
-# What's NOT included:
-#   - node_modules, container/agent-runner/node_modules, dist/, logs/
-#   - .claude/settings.local.json (host-specific permissions)
-#   - macOS-specific files (LaunchAgents plist, /opt/homebrew refs)
-#
-# Encryption: the tarball is encrypted with openssl AES-256-CBC using a passphrase
-# you type interactively. The passphrase never gets stored on disk and never
-# crosses the network (you type it again on the destination machine to decrypt).
+# Usage:  bash scripts/migrate/bundle.sh <output-path.enc>
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <output-path.tar.gz.enc>" >&2
+  echo "Usage: $0 <output-path.enc>" >&2
   exit 64
 fi
 OUT="$1"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-# --- sanity checks
+# ---- preflight ----
 [ -f data/v2.db ] || { echo "❌ data/v2.db not found — wrong directory?"; exit 1; }
-[ -f .env ] || { echo "⚠ .env missing — continuing anyway."; }
 command -v openssl >/dev/null || { echo "❌ openssl not on PATH"; exit 1; }
+command -v docker  >/dev/null || { echo "❌ docker not on PATH";  exit 1; }
 
-# --- ask user to stop service so the DB is in a consistent state
-echo "ℹ Before bundling, stop the host service so SQLite files are flushed."
-echo "  macOS: launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist"
-read -r -p "Service stopped? [y/N] " ans
-case "$ans" in [yY]*) ;; *) echo "Aborted."; exit 1;; esac
+ONECLI_APP=$(docker ps --filter "name=onecli-app-1" --format '{{.Names}}' || true)
+ONECLI_PG=$(docker ps --filter "name=onecli-postgres-1" --format '{{.Names}}' || true)
+if [ -z "$ONECLI_APP" ] || [ -z "$ONECLI_PG" ]; then
+  echo "❌ OneCLI containers (onecli-app-1, onecli-postgres-1) must be running so we can dump the vault."
+  echo "   Start them with:  docker compose -f ~/.onecli/docker-compose.yml up -d"
+  exit 1
+fi
 
-# --- assemble staging dir
+# warn if nanoclaw service still running (DB write inconsistency risk)
+if launchctl list 2>/dev/null | grep -q com.nanoclaw; then
+  echo "⚠ The nanoclaw service is still running (launchd shows com.nanoclaw)."
+  echo "  Stop it first so SQLite files are flushed:"
+  echo "    launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist"
+  read -r -p "  Continue anyway? [y/N] " ans
+  case "$ans" in [yY]*) ;; *) echo "Aborted."; exit 1;; esac
+fi
+
+# ---- stage ----
 STAGE=$(mktemp -d -t nanoclaw-bundle-XXXXXX)
 trap "rm -rf '$STAGE'" EXIT
+mkdir -p "$STAGE/onecli"
 echo "→ Staging at $STAGE"
 
-# Mirror the repo (working tree) excluding heavy / host-specific bits.
-# Use rsync if available (faster + handles symlinks); fall back to tar.
-EXCLUDES=(
-  --exclude=node_modules --exclude='**/node_modules'
-  --exclude=dist --exclude='container/agent-runner/dist'
-  --exclude=logs --exclude='**/logs/*'
-  --exclude='.git'
-  --exclude='.claude/settings.local.json'
-  --exclude='.DS_Store'
-  --exclude='*.bundle.tar.gz*'
-)
-mkdir -p "$STAGE/repo"
-if command -v rsync >/dev/null; then
-  rsync -a "${EXCLUDES[@]}" ./ "$STAGE/repo/"
-else
-  (cd "$ROOT" && tar -cf - "${EXCLUDES[@]}" .) | (cd "$STAGE/repo" && tar -xf -)
-fi
+# repo-local state
+echo "  • copying .env, data/, groups/"
+[ -f .env ] && cp .env "$STAGE/.env"
+rsync -a --exclude='logs/' data/   "$STAGE/data/"
+rsync -a --exclude='logs/' groups/ "$STAGE/groups/"
 
-# OneCLI config (vault + secrets are typically here on macOS+Linux)
-if [ -d "$HOME/.onecli" ]; then
-  mkdir -p "$STAGE/onecli"
-  rsync -a "$HOME/.onecli/" "$STAGE/onecli/"
-  echo "  ✓ Bundled ~/.onecli/"
-else
-  echo "  ⚠ No ~/.onecli/ found — you'll need to re-init OneCLI manually on the target."
-fi
+# OneCLI Postgres dump (logical, cross-arch)
+echo "  • dumping OneCLI Postgres (logical)…"
+docker exec "$ONECLI_PG" pg_dump -U onecli -d onecli \
+  --clean --if-exists --no-owner --no-acl \
+  > "$STAGE/onecli/pgdump.sql"
+DUMP_BYTES=$(wc -c < "$STAGE/onecli/pgdump.sql")
+echo "    → $DUMP_BYTES bytes"
 
-# Record the original repo root so restore can fix-up absolute paths
-echo "$ROOT" > "$STAGE/ORIGINAL_ROOT.txt"
-date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGE/BUNDLED_AT.txt"
-uname -a > "$STAGE/SOURCE_UNAME.txt"
+# OneCLI app-data volume (contains secret-encryption-key)
+echo "  • exporting onecli_app-data volume…"
+docker run --rm \
+  -v onecli_app-data:/src:ro \
+  -v "$STAGE/onecli":/out \
+  alpine sh -c 'cd /src && tar -czpf /out/app-data.tar.gz .'
 
-# --- tar + encrypt in one pipeline
-echo "→ Compressing + encrypting → $OUT"
-echo "  You'll be prompted for a passphrase TWICE. Remember it — you need the same one on the Linux machine."
+# OneCLI runtime env (NEXTAUTH_SECRET + POSTGRES_*)
+echo "  • capturing NEXTAUTH_SECRET and POSTGRES_* env…"
+docker exec "$ONECLI_APP" env \
+  | grep -E '^(NEXTAUTH_SECRET|NEXTAUTH_URL|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' \
+  > "$STAGE/onecli/env.txt"
+
+# OneCLI client config
+mkdir -p "$STAGE/onecli/dotfiles"
+[ -f "$HOME/.onecli/config.json" ]        && cp "$HOME/.onecli/config.json"        "$STAGE/onecli/dotfiles/"
+[ -f "$HOME/.onecli/docker-compose.yml" ] && cp "$HOME/.onecli/docker-compose.yml" "$STAGE/onecli/dotfiles/"
+
+# Manifest
+cat > "$STAGE/MANIFEST.json" <<EOF
+{
+  "bundle_version": 2,
+  "created_at":     "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "source_root":    "$ROOT",
+  "source_uname":   "$(uname -s)/$(uname -m)",
+  "onecli_secrets_count": $(docker exec "$ONECLI_PG" psql -U onecli -d onecli -tAc 'SELECT count(*) FROM secrets')
+}
+EOF
+echo "  • manifest written"
+
+# ---- encrypt ----
+echo "→ Encrypting → $OUT"
+echo "  You'll be prompted for a passphrase TWICE. Use 4+ random words."
 (cd "$STAGE" && tar -cf - .) \
   | gzip -1 \
   | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -out "$OUT"
@@ -89,7 +107,8 @@ SIZE=$(du -h "$OUT" | awk '{print $1}')
 echo ""
 echo "✅ Bundle ready: $OUT ($SIZE)"
 echo ""
-echo "Next steps:"
-echo "  1. Transfer the .enc file to the Linux machine (scp / USB / cloud drive)."
-echo "  2. On the Linux machine, in Claude Code: run /move-to-linux"
-echo "     (or directly: bash scripts/migrate/restore.sh <bundle.enc> ~/nanoclaw)"
+echo "Transfer it OUT-OF-BAND (USB / scp / never email)."
+echo "On the Linux machine:"
+echo "  1. git clone https://github.com/v4l3rio/nanoclaw.git ~/nanoclaw"
+echo "  2. cp /media/usb/$(basename "$OUT") ~/"
+echo "  3. cd ~/nanoclaw && bash scripts/migrate/restore.sh ~/$(basename "$OUT") ~/nanoclaw"

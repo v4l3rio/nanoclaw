@@ -1,116 +1,139 @@
 #!/usr/bin/env bash
-# restore.sh — restore a NanoClaw bundle produced by bundle.sh, fix host-specific
-# absolute paths, install deps, build the agent container, install the systemd
-# user unit, and start the service.
+# restore.sh — restore a NanoClaw bundle produced by bundle.sh (v2).
 #
-# Usage:
-#   bash scripts/migrate/restore.sh <bundle.tar.gz.enc> <dest-dir>
+# Assumes the code is already on disk via `git clone`. This script restores
+# secrets + state + OneCLI vault, installs deps, builds, and brings up the
+# always-on systemd service.
 #
-# Example:
-#   bash restore.sh ~/nanoclaw-bundle.enc ~/nanoclaw
-#
-# Idempotent: re-running on top of an existing install just refreshes things.
+# Usage:  bash scripts/migrate/restore.sh <bundle.enc> <dest-dir>
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
-  echo "Usage: $0 <bundle.tar.gz.enc> <dest-dir>" >&2
+  echo "Usage: $0 <bundle.enc> <dest-dir>" >&2
   exit 64
 fi
 BUNDLE="$1"
 DEST="$2"
 
 [ -f "$BUNDLE" ] || { echo "❌ Bundle not found: $BUNDLE"; exit 1; }
+[ -d "$DEST/.git" ] || { echo "❌ $DEST is not a git checkout. Run 'git clone' first."; exit 1; }
+DEST="$(cd "$DEST" && pwd)"
 
-# --- preflight: check deps ---
+# ---- preflight: deps ----
 need=()
-for cmd in openssl tar gzip rsync git; do
+for cmd in openssl tar gzip rsync git docker pnpm bun node; do
   command -v "$cmd" >/dev/null || need+=("$cmd")
 done
-command -v docker >/dev/null || need+=("docker")
-command -v node >/dev/null || need+=("node (>=20)")
-command -v pnpm >/dev/null || need+=("pnpm")
-command -v bun >/dev/null || need+=("bun")
 if [ ${#need[@]} -gt 0 ]; then
-  echo "❌ Missing tools on this machine: ${need[*]}"
-  echo ""
-  echo "Install them first. Quick recipes (Debian/Ubuntu):"
-  echo "  sudo apt update && sudo apt install -y rsync git openssl ca-certificates curl"
-  echo "  curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker \$USER"
-  echo "  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs"
-  echo "  npm install -g pnpm"
-  echo "  curl -fsSL https://bun.sh/install | bash"
+  cat <<EOF
+❌ Missing: ${need[*]}
+
+Install (Debian/Ubuntu):
+  sudo apt update && sudo apt install -y openssl rsync git ca-certificates curl
+  curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker \$USER  # then log out/in
+  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
+  npm install -g pnpm
+  curl -fsSL https://bun.sh/install | bash
+EOF
   exit 1
 fi
 
-mkdir -p "$DEST"
-DEST="$(cd "$DEST" && pwd)"
-
-# --- decrypt + extract ---
+# ---- decrypt ----
 STAGE=$(mktemp -d -t nanoclaw-restore-XXXXXX)
 trap "rm -rf '$STAGE'" EXIT
-echo "→ Decrypting bundle (you'll be prompted for the passphrase)…"
+echo "→ Decrypting bundle (passphrase prompt next)…"
 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$BUNDLE" | gunzip | tar -xf - -C "$STAGE"
 
-[ -f "$STAGE/ORIGINAL_ROOT.txt" ] || { echo "❌ Bundle malformed (missing ORIGINAL_ROOT.txt)"; exit 1; }
-ORIGINAL_ROOT="$(cat "$STAGE/ORIGINAL_ROOT.txt")"
-echo "  Original root was: $ORIGINAL_ROOT"
-echo "  Restoring to:      $DEST"
+[ -f "$STAGE/MANIFEST.json" ] || { echo "❌ Bundle malformed (no MANIFEST.json)"; exit 1; }
+ORIGINAL_ROOT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).source_root)' "$STAGE/MANIFEST.json")
+SECRETS_COUNT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).onecli_secrets_count)' "$STAGE/MANIFEST.json")
+echo "  source root: $ORIGINAL_ROOT"
+echo "  dest root:   $DEST"
+echo "  OneCLI secrets in bundle: $SECRETS_COUNT"
 
-# --- copy repo into dest ---
-echo "→ Copying repo tree…"
-rsync -a --delete-excluded \
-  --exclude='data/' --exclude='groups/' --exclude='.env' \
-  "$STAGE/repo/" "$DEST/"
-# Then bring data/, groups/, .env into place (separate pass: we may want to
-# preserve a pre-existing data/ if user re-runs restore — but for a fresh
-# migration this overwrites).
-rsync -a "$STAGE/repo/data/"    "$DEST/data/"    2>/dev/null || true
-rsync -a "$STAGE/repo/groups/"  "$DEST/groups/"  2>/dev/null || true
-[ -f "$STAGE/repo/.env" ] && cp "$STAGE/repo/.env" "$DEST/.env"
+# ---- restore repo-local state ----
+echo "→ Restoring .env, data/, groups/"
+[ -f "$STAGE/.env" ]   && cp "$STAGE/.env"   "$DEST/.env"
+[ -d "$STAGE/data"   ] && rsync -a "$STAGE/data/"   "$DEST/data/"
+[ -d "$STAGE/groups" ] && rsync -a "$STAGE/groups/" "$DEST/groups/"
 
-# --- fix-up absolute paths in any file that references ORIGINAL_ROOT ---
+# Rewrite any leftover absolute paths in text-config files
 if [ -n "$ORIGINAL_ROOT" ] && [ "$ORIGINAL_ROOT" != "$DEST" ]; then
-  echo "→ Rewriting absolute paths: $ORIGINAL_ROOT → $DEST"
-  # text files only; binaries (SQLite) don't store host paths
-  find "$DEST" -type f \( -name '*.json' -o -name '*.sh' -o -name '*.md' -o -name '*.env' -o -name '*.ts' \) \
+  echo "→ Rewriting paths: $ORIGINAL_ROOT → $DEST"
+  find "$DEST" -type f \( -name '*.json' -o -name '*.sh' -o -name '*.md' -o -name '*.local.md' \) \
     -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/logs/*" \
     -exec grep -l "$ORIGINAL_ROOT" {} + 2>/dev/null \
-    | while read -r f; do
-      sed -i.bak "s|$ORIGINAL_ROOT|$DEST|g" "$f" && rm -f "$f.bak"
-    done
+    | while read -r f; do sed -i "s|$ORIGINAL_ROOT|$DEST|g" "$f"; done
 fi
 
-# --- restore OneCLI config ---
-if [ -d "$STAGE/onecli" ]; then
-  echo "→ Restoring ~/.onecli/"
-  mkdir -p "$HOME/.onecli"
-  rsync -a "$STAGE/onecli/" "$HOME/.onecli/"
-  echo "  ✓ done. If OneCLI binary isn't installed yet, fetch the Linux release:"
-  echo "    See: https://github.com/anthropics/onecli (or use /init-onecli skill)"
+# ---- restore OneCLI client config ----
+mkdir -p "$HOME/.onecli"
+[ -f "$STAGE/onecli/dotfiles/config.json" ]        && cp "$STAGE/onecli/dotfiles/config.json"        "$HOME/.onecli/"
+[ -f "$STAGE/onecli/dotfiles/docker-compose.yml" ] && cp "$STAGE/onecli/dotfiles/docker-compose.yml" "$HOME/.onecli/"
+
+# Write OneCLI runtime env where compose expects it (~/.env, per ../.env in compose)
+if [ -s "$STAGE/onecli/env.txt" ]; then
+  echo "→ Writing OneCLI runtime env to ~/.env"
+  # remove any prior matching entries, then append
+  if [ -f "$HOME/.env" ]; then
+    grep -vE '^(NEXTAUTH_SECRET|NEXTAUTH_URL|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' "$HOME/.env" > "$HOME/.env.tmp" || true
+    mv "$HOME/.env.tmp" "$HOME/.env"
+  fi
+  cat "$STAGE/onecli/env.txt" >> "$HOME/.env"
+  chmod 600 "$HOME/.env"
 fi
 
-# --- install deps ---
+# ---- restore OneCLI Docker volumes ----
+echo "→ Restoring OneCLI volumes (pg + app-data)…"
+docker volume create onecli_pgdata    >/dev/null
+docker volume create onecli_app-data  >/dev/null
+
+# Populate app-data with master key (must exist BEFORE app starts)
+docker run --rm \
+  -v onecli_app-data:/dst \
+  -v "$STAGE/onecli":/src:ro \
+  alpine sh -c 'cd /dst && tar -xzpf /src/app-data.tar.gz'
+
+# Bring up Postgres only, restore the dump, then start the rest
+( cd "$HOME/.onecli" && docker compose up -d postgres )
+echo "  • waiting for postgres to accept connections…"
+for i in {1..30}; do
+  if docker exec onecli-postgres-1 pg_isready -U onecli >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+
+echo "  • restoring pgdump.sql…"
+docker exec -i onecli-postgres-1 psql -U onecli -d onecli < "$STAGE/onecli/pgdump.sql" >/dev/null
+( cd "$HOME/.onecli" && docker compose up -d )
+
+# verify
+sleep 3
+RESTORED=$(docker exec onecli-postgres-1 psql -U onecli -d onecli -tAc 'SELECT count(*) FROM secrets' 2>/dev/null || echo 0)
+echo "  ✓ OneCLI secrets restored: $RESTORED (expected $SECRETS_COUNT)"
+if [ "$RESTORED" != "$SECRETS_COUNT" ]; then
+  echo "  ⚠ Mismatch — check 'docker logs onecli-app-1' if downstream calls 401."
+fi
+
+# ---- nanoclaw deps + build ----
 echo "→ pnpm install (host)…"
-(cd "$DEST" && pnpm install --frozen-lockfile)
-
+( cd "$DEST" && pnpm install --frozen-lockfile )
 echo "→ bun install (agent-runner)…"
-(cd "$DEST/container/agent-runner" && bun install --frozen-lockfile)
-
+( cd "$DEST/container/agent-runner" && bun install --frozen-lockfile )
 echo "→ pnpm build…"
-(cd "$DEST" && pnpm run build)
+( cd "$DEST" && pnpm run build )
 
-# --- fix DB additionalMounts paths (container_configs in v2.db) ---
-echo "→ Patching container_configs.config_json mount paths in DB…"
-(cd "$DEST" && pnpm exec tsx scripts/migrate/fix-db-paths.ts "$ORIGINAL_ROOT" "$DEST")
+# Fix container_configs hostPath mounts (additionalMounts)
+echo "→ Patching container_configs hostPath mounts…"
+( cd "$DEST" && pnpm exec tsx scripts/migrate/fix-db-paths.ts "$ORIGINAL_ROOT" "$DEST" )
 
-# --- build container image ---
-echo "→ Building agent container image…"
-(cd "$DEST" && ./container/build.sh)
+echo "→ Building agent container image (this may take a few minutes)…"
+( cd "$DEST" && ./container/build.sh )
 
-# --- install systemd user unit (Linux) ---
+# ---- systemd unit + always-on hardening ----
 if [ "$(uname)" = "Linux" ] && command -v systemctl >/dev/null; then
   echo "→ Installing systemd user unit…"
-  mkdir -p "$HOME/.config/systemd/user"
+  mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/nanoclaw"
+
   cat > "$HOME/.config/systemd/user/nanoclaw.service" <<EOF
 [Unit]
 Description=NanoClaw host (always-on personal assistant)
@@ -123,10 +146,8 @@ WorkingDirectory=$DEST
 ExecStart=$DEST/start.sh
 Restart=always
 RestartSec=5
-# crash-loop guard: max 10 restarts in 5 min, then stop
 StartLimitIntervalSec=300
 StartLimitBurst=10
-# journald handles logs (rotated + size-capped); files only on demand
 StandardOutput=append:$DEST/logs/nanoclaw.log
 StandardError=append:$DEST/logs/nanoclaw.error.log
 
@@ -134,8 +155,6 @@ StandardError=append:$DEST/logs/nanoclaw.error.log
 WantedBy=default.target
 EOF
 
-  # logrotate config for the nanoclaw text logs
-  mkdir -p "$HOME/.config/nanoclaw"
   cat > "$HOME/.config/nanoclaw/logrotate.conf" <<EOF
 $DEST/logs/*.log {
   daily
@@ -149,76 +168,41 @@ EOF
 
   systemctl --user daemon-reload
 
-  # -----------------------------------------------------------------
-  # Always-on hardening — applied automatically here so this Linux box
-  # behaves like an actual 24/7 personal assistant.
-  # All sudo calls are batched at the top so the user types the password once.
-  # -----------------------------------------------------------------
   echo ""
-  echo "→ Applying always-on hardening (you'll be asked for sudo once)…"
-
-  sudo -v   # prime sudo, single password prompt
-
-  # 1. Docker daemon starts at boot
-  if systemctl list-unit-files docker.service >/dev/null 2>&1; then
-    sudo systemctl enable --now docker >/dev/null 2>&1 \
-      && echo "  ✓ docker.service enabled at boot" \
-      || echo "  ⚠ could not enable docker.service"
-  fi
-
-  # 2. User service survives logout
+  echo "→ Always-on hardening (sudo prompt next, single password)…"
+  sudo -v
+  sudo systemctl enable --now docker >/dev/null 2>&1 && echo "  ✓ docker enabled at boot"
   if ! loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes'; then
-    sudo loginctl enable-linger "$USER" \
-      && echo "  ✓ user lingering enabled" \
-      || echo "  ⚠ could not enable linger"
-  else
-    echo "  ✓ user lingering already on"
+    sudo loginctl enable-linger "$USER" && echo "  ✓ user lingering enabled"
   fi
-
-  # 3. Disable lid suspend (no-op on desktops; matters on laptops)
   if [ -f /etc/systemd/logind.conf ]; then
-    sudo sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/'           /etc/systemd/logind.conf
-    sudo sed -i 's/^#*HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/' /etc/systemd/logind.conf
+    sudo sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/'                       /etc/systemd/logind.conf
+    sudo sed -i 's/^#*HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/'           /etc/systemd/logind.conf
     sudo sed -i 's/^#*HandleLidSwitchExternalPower=.*/HandleLidSwitchExternalPower=ignore/' /etc/systemd/logind.conf
-    sudo systemctl restart systemd-logind 2>/dev/null \
-      && echo "  ✓ lid-close suspend disabled"
+    sudo systemctl restart systemd-logind 2>/dev/null && echo "  ✓ lid suspend disabled"
   fi
-
-  # 4. Mask system sleep targets (machine never auto-suspends)
-  sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null 2>&1 \
-    && echo "  ✓ system sleep masked"
-
-  # 5. Daily log rotation via user crontab
-  CRON_LINE="15 3 * * * /usr/sbin/logrotate -s \$HOME/.cache/nanoclaw-logrotate.state \$HOME/.config/nanoclaw/logrotate.conf"
+  sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null 2>&1 && echo "  ✓ sleep targets masked"
   if ! crontab -l 2>/dev/null | grep -q 'nanoclaw-logrotate.state'; then
-    ( crontab -l 2>/dev/null; echo "$CRON_LINE" ) | crontab -
-    echo "  ✓ logrotate cron installed (daily 03:15)"
-  else
-    echo "  ✓ logrotate cron already present"
+    ( crontab -l 2>/dev/null; echo "15 3 * * * /usr/sbin/logrotate -s \$HOME/.cache/nanoclaw-logrotate.state \$HOME/.config/nanoclaw/logrotate.conf" ) | crontab -
+    echo "  ✓ daily logrotate cron installed"
   fi
-
-  # 6. Unattended security updates (Debian/Ubuntu only)
   if command -v apt-get >/dev/null; then
     sudo apt-get install -y unattended-upgrades >/dev/null 2>&1 \
       && sudo dpkg-reconfigure -f noninteractive --priority=low unattended-upgrades >/dev/null 2>&1 \
       && echo "  ✓ unattended-upgrades enabled"
   fi
+
   echo ""
-  echo "✅ Restore complete."
-  echo ""
-  echo "To start NanoClaw:"
-  echo "  systemctl --user enable --now nanoclaw"
-  echo "  systemctl --user status nanoclaw"
-  echo "  tail -f $DEST/logs/nanoclaw.log"
+  echo "✅ Restore complete. Start the service:"
+  echo "    systemctl --user enable --now nanoclaw"
+  echo "    tail -f $DEST/logs/nanoclaw.log"
 else
   echo ""
-  echo "✅ Restore complete (no systemd detected — start manually with: $DEST/start.sh)"
+  echo "✅ Restore complete (no systemd — start manually with: $DEST/start.sh)"
 fi
 
 echo ""
-echo "Final sanity checks (read-only):"
+echo "Sanity checks:"
+echo "  onecli secrets list                       # should print $SECRETS_COUNT secrets"
 echo "  $DEST/bin/ncl groups list"
 echo "  $DEST/bin/ncl messaging-groups list"
-echo "  onecli agents list                       # verify the agent vault has your secrets"
-echo "  loginctl show-user \$USER | grep Linger   # should print Linger=yes"
-echo "  systemctl is-enabled docker              # should print enabled"
