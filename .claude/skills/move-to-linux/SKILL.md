@@ -1,6 +1,6 @@
 ---
 name: move-to-linux
-description: Restore a NanoClaw install on this Linux machine from a Mac-produced encrypted bundle. Two channels — code via git clone, secrets+state via the bundle. Configures always-on systemd.
+description: Restore a NanoClaw install on this Linux machine from a Mac-produced encrypted bundle. Detects the distro, installs any missing dependencies (asking for sudo once), then restores code + secrets + OneCLI vault and configures the always-on systemd service.
 ---
 
 # /move-to-linux
@@ -8,100 +8,216 @@ description: Restore a NanoClaw install on this Linux machine from a Mac-produce
 End-to-end restore on the **destination Linux machine**. Two transfer channels:
 
 - **Code** → `git clone https://github.com/v4l3rio/nanoclaw.git` (public, no secrets)
-- **Secrets + state** → encrypted bundle file produced on the Mac by `scripts/migrate/bundle.sh` (`.env`, `data/`, `groups/`, full OneCLI vault dump + master key + NEXTAUTH_SECRET)
+- **Secrets + state** → encrypted bundle file produced on the Mac by `scripts/migrate/bundle.sh`
 
-## Step 1 — preflight
+The skill auto-detects the distro, installs missing tools, then chains into `restore.sh`. User confirms once at the start; afterwards it runs unattended until the systemd service is up.
 
-Verify required tools:
+---
 
-```bash
-for c in openssl rsync git docker node pnpm bun; do
-  printf '%-8s %s\n' "$c" "$(command -v $c || echo MISSING)"
-done
-node --version    # need >= 20
-docker --version
-```
+## Step 0 — confirm scope with the user
 
-If anything is `MISSING`, tell the user which command to install — do not install system-wide things without explicit consent.
+Ask, in this order, ALL up-front (don't drip-feed prompts):
 
-Quick recipes (Debian/Ubuntu):
-- `sudo apt update && sudo apt install -y openssl rsync git ca-certificates curl`
-- `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER` (re-login after)
-- `curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs`
-- `npm install -g pnpm`
-- `curl -fsSL https://bun.sh/install | bash`
+1. Full path to the encrypted bundle (e.g. `~/Downloads/nanoclaw-bundle.enc`).
+2. Destination directory (default `~/nanoclaw`).
+3. Permission to install missing system packages with `sudo` (yes/no).
 
-## Step 2 — clone the repo
+If the user says "no" to #3, stop and tell them which packages are missing so they install them manually, then re-invoke the skill.
+
+---
+
+## Step 1 — detect environment
+
+Run:
 
 ```bash
-git clone https://github.com/v4l3rio/nanoclaw.git ~/nanoclaw
+. /etc/os-release && echo "$ID $VERSION_ID $ID_LIKE"
+uname -m
 ```
 
-Default dest is `~/nanoclaw` but the user can choose anywhere.
+Branch on `$ID` / `$ID_LIKE`:
 
-## Step 3 — transfer the bundle
+| Detected | Package manager | Notes |
+|---|---|---|
+| `ubuntu`, `debian`, `linuxmint`, `pop`, `*` containing `debian` | `apt-get` | most common path |
+| `fedora`, `rhel`, `centos`, `*` containing `rhel`/`fedora` | `dnf` | |
+| `arch`, `manjaro` | `pacman` | |
+| `alpine` | `apk` | rare, mostly WSL |
+| anything else | unknown | tell user to install manually |
 
-The bundle is the `.enc` file the user produced on the Mac. Options:
+If WSL: also detect via `grep -qi microsoft /proc/version` — Docker setup differs slightly (user often runs Docker Desktop on Windows side instead of native).
 
-- **USB**: plug in, `cp /media/<user>/<usb>/nanoclaw-bundle.enc ~/` — cleanest, air-gapped.
-- **scp**: `scp user@mac:~/nanoclaw-bundle.enc ~/` — needs SSH on either side.
-- **AirDrop, Drive, Dropbox**: the file is already AES-256 encrypted, so it's safe in transit, but USB is still preferred for one-shot.
+---
 
-## Step 4 — run the restore
+## Step 2 — check what's installed
+
+For each of these tools, run `command -v <tool>` and record which are MISSING:
+
+| Tool | Required version | Why |
+|---|---|---|
+| `openssl` | any | decrypt bundle |
+| `rsync` | any | copy data/ groups/ |
+| `git` | any | already cloned the repo but checked anyway |
+| `tar`, `gzip` | any | bundle archive |
+| `curl` | any | bootstrap installs of bun |
+| `docker` | any (CE) | run agent containers + OneCLI |
+| `node` | **≥ 20** | host runtime |
+| `pnpm` | any | host package manager |
+| `bun` | any | agent-runner runtime |
+| `jq` | any | nice-to-have for debugging |
+
+For `node`, also check the version: `node -v` — if < 20, treat as MISSING (will reinstall via NodeSource).
+
+---
+
+## Step 3 — install the missing pieces
+
+If everything is present, skip to Step 4. Otherwise, run **only the install blocks for missing tools**, in this order (some have dependencies):
+
+### Debian/Ubuntu
 
 ```bash
-cd ~/nanoclaw
-bash scripts/migrate/restore.sh ~/nanoclaw-bundle.enc ~/nanoclaw
+# Base packages (only run if any of these are missing)
+sudo apt-get update -y
+sudo apt-get install -y openssl rsync git ca-certificates curl gzip tar jq
+
+# Docker (only if missing)
+if ! command -v docker >/dev/null; then
+  curl -fsSL https://get.docker.com | sh
+  sudo usermod -aG docker "$USER"
+  sudo systemctl enable --now docker
+fi
+
+# Node ≥ 20 (only if missing or too old)
+if ! command -v node >/dev/null || [ "$(node -v | sed 's/v//;s/\..*//')" -lt 20 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+fi
+
+# pnpm (only if missing)
+command -v pnpm >/dev/null || sudo npm install -g pnpm
+
+# Bun (only if missing) — user-local install, no sudo
+command -v bun >/dev/null || (curl -fsSL https://bun.sh/install | bash && \
+  echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.bashrc && \
+  export PATH="$HOME/.bun/bin:$PATH")
 ```
 
-The script will:
-1. Prompt for the bundle passphrase (same one used on the Mac).
-2. Restore `.env`, `data/`, `groups/` into the cloned repo.
-3. Rewrite any absolute path that referenced the Mac install root.
-4. **Restore the OneCLI vault**:
-   - create Docker volumes `onecli_pgdata` + `onecli_app-data`
-   - extract the master key into `app-data`
-   - `docker compose up postgres`
-   - `psql … < pgdump.sql` → restore secrets table
-   - write `NEXTAUTH_SECRET` + `POSTGRES_*` to `~/.env`
-   - `docker compose up -d` (full OneCLI stack)
-5. `pnpm install` + `bun install` + build host + build agent container image.
-6. Patch `container_configs.config_json` host paths in `data/v2.db`.
-7. Install the systemd user unit with `Restart=always`.
-8. Apply always-on hardening (sudo prompt once): docker enabled at boot, `loginctl enable-linger`, lid suspend disabled, sleep targets masked, daily logrotate cron, unattended-upgrades.
-
-Expect ~10 minutes total, dominated by `./container/build.sh` (Docker image bake).
-
-## Step 5 — verify
+### Fedora/RHEL
 
 ```bash
-onecli secrets list                    # should print the same count as on the Mac
-~/nanoclaw/bin/ncl groups list
-~/nanoclaw/bin/ncl messaging-groups list
-systemctl --user start nanoclaw
-tail -f ~/nanoclaw/logs/nanoclaw.log
+sudo dnf install -y openssl rsync git ca-certificates curl gzip tar jq
+
+if ! command -v docker >/dev/null; then
+  sudo dnf install -y dnf-plugins-core
+  sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+  sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  sudo usermod -aG docker "$USER"
+  sudo systemctl enable --now docker
+fi
+
+if ! command -v node >/dev/null || [ "$(node -v | sed 's/v//;s/\..*//')" -lt 20 ]; then
+  curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
+  sudo dnf install -y nodejs
+fi
+
+command -v pnpm >/dev/null || sudo npm install -g pnpm
+command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash
 ```
 
-Send a test message on the wired channel. First message after a fresh install respawns each agent's container — expect 10-20s delay. Subsequent messages should dispatch immediately.
+### Arch/Manjaro
+
+```bash
+sudo pacman -S --needed --noconfirm openssl rsync git ca-certificates curl gzip tar jq docker nodejs npm
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+command -v pnpm >/dev/null || sudo npm install -g pnpm
+command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash
+```
+
+### Unknown distro
+
+Print a clear message: which tools are missing, link to each project's install docs, and stop.
+
+---
+
+## Step 4 — the docker-group gotcha
+
+If you just added the user to the `docker` group, the current shell still **doesn't** have it in its group list. Test:
+
+```bash
+docker ps >/dev/null 2>&1 && echo OK || echo NEEDS_RELOGIN
+```
+
+If `NEEDS_RELOGIN`, tell the user verbatim:
+
+> Ho aggiunto il tuo utente al gruppo `docker`. Per usarlo senza `sudo` devi fare logout e login (oppure riavviare). Alternativa rapida: lancia `newgrp docker` in questa shell, poi ri-invoca `/move-to-linux`.
+
+Then stop. Don't try to work around with `sudo docker` — the restore script and nanoclaw runtime expect rootless docker access.
+
+---
+
+## Step 5 — clone the repo (if not already)
+
+```bash
+if [ ! -d "$DEST/.git" ]; then
+  git clone https://github.com/v4l3rio/nanoclaw.git "$DEST"
+fi
+```
+
+Use the destination directory the user gave at Step 0.
+
+---
+
+## Step 6 — run the restore
+
+```bash
+cd "$DEST"
+bash scripts/migrate/restore.sh "$BUNDLE_PATH" "$DEST"
+```
+
+The script handles everything from here: decrypts (prompts the user for the passphrase), restores `.env`/`data`/`groups`, brings up the OneCLI vault (Postgres dump + master key volume + NEXTAUTH_SECRET), installs the JS deps, patches DB paths, builds the agent container, installs the systemd unit, and applies always-on hardening with a single sudo prompt.
+
+While it runs, **don't interrupt**. The Docker image build alone takes 3-5 minutes.
+
+---
+
+## Step 7 — verify and start
+
+```bash
+onecli secrets list                    # expected count printed by restore.sh at the end
+"$DEST"/bin/ncl groups list
+"$DEST"/bin/ncl messaging-groups list
+systemctl --user enable --now nanoclaw
+systemctl --user status nanoclaw
+tail -f "$DEST"/logs/nanoclaw.log
+```
+
+Have the user send a test message on the wired channel. First message respawns each agent's container — expect 10-20s. Subsequent messages dispatch immediately.
+
+---
 
 ## Common gotchas
 
-- **`docker` denied** → user not in `docker` group. `sudo usermod -aG docker $USER` then log out/in.
-- **`onecli secrets list` empty** → check `docker logs onecli-app-1` and `docker logs onecli-postgres-1`. Most common cause: `NEXTAUTH_SECRET` mismatch between bundle and `~/.env`. Re-run restore (idempotent).
-- **`NODE_MODULE_VERSION` mismatch** for better-sqlite3 → `(cd ~/nanoclaw && pnpm rebuild better-sqlite3)`.
-- **Channels with webhooks** (not Telegram/polling) → public URL likely changed. Re-register webhook on the platform side; tokens themselves are restored automatically by the OneCLI vault.
+- **`docker` denied**: the docker-group re-login dance (Step 4). Verify with `groups | grep docker`.
+- **`onecli secrets list` empty**: check `docker logs onecli-app-1`. Most common cause is `NEXTAUTH_SECRET` mismatch between bundle and `~/.env`. Re-run `restore.sh` — it's idempotent.
+- **`NODE_MODULE_VERSION` mismatch** for `better-sqlite3`: `(cd $DEST && pnpm rebuild better-sqlite3)`.
+- **Channels with webhooks** (not Telegram polling): the public URL is different from the Mac. Re-register the webhook on the platform side. The auth token itself is already restored via OneCLI.
+- **WSL2**: `systemctl --user` works but `loginctl enable-linger` is a no-op (services stop when WSL stops). Tell the user they need to keep WSL running or use `wsl --no-distribution` tricks.
 
-## Only thing left to the human
+---
 
-- BIOS/UEFI: set `AC Power Recovery = Power On` so the machine reboots itself after a power outage. The OS can't do this for you.
+## What's left to the human (and only the human)
+
+- BIOS/UEFI: `AC Power Recovery = Power On` so the box reboots itself after a blackout. No OS-level command can do this.
+
+---
 
 ## Rollback
 
-The restore is non-destructive on the Mac side — re-bundle and re-restore freely. If the Linux restore goes wrong:
-
 ```bash
 systemctl --user stop nanoclaw 2>/dev/null
-docker compose -f ~/.onecli/docker-compose.yml down -v   # also removes volumes
-rm -rf ~/nanoclaw
-# then git clone again and re-run restore.sh
+docker compose -f ~/.onecli/docker-compose.yml down -v   # also wipes volumes
+rm -rf "$DEST"
+# then re-invoke /move-to-linux from scratch
 ```
